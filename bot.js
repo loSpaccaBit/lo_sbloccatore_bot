@@ -509,7 +509,7 @@ Continua così! 🚀`;
 
     async sendReferralLink(chatId, telegramId) {
         const referralLink = `https://t.me/${this.BOT_USERNAME}?start=${telegramId}`;
-        const message = `🔗 <b>Il tuo link:</b>\n<code>${referralLink}</code>\n\n` +
+        const message = `🔗 <b>Il tuo link:</b>\n${referralLink}\n\n` +
             `💡 Condividilo con i tuoi amici per guadagnare punti!`;
 
         await this.bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
