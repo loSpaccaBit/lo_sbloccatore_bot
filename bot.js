@@ -241,7 +241,7 @@ class ReferralBot {
                                 '🎉 <b>Benvenuto nel canale!</b>\n\n' +
                                 '✅ La tua iscrizione è stata verificata automaticamente!\n' +
                                 (user.referrer_code && user.referrer_code !== telegramId ?
-                                    '🎁 Il tuo referrer ha ricevuto 1 punto!' : ''),
+                                    '🎁 Il tuo amico ha ricevuto 1 punto!\n\nProvaci anche TU!' : ''),
                                 { parse_mode: 'HTML' }
                             );
                         } catch (notifyError) {
@@ -475,15 +475,12 @@ class ReferralBot {
 
     async sendChannelInstructions(chatId, hasReferrer) {
         const channelLink = this.CHANNEL_USERNAME || this.CHANNEL_NAME || 'il nostro canale';
-
-        const message = `📱 <b>Completa la registrazione:</b>\n\n` +
-            `1️⃣ Iscriviti al nostro canale: ${channelLink}\n` +
-            `2️⃣ Torna qui e usa il comando /verify\n\n` +
-            `✅ <b>Solo dopo l'iscrizione al canale:</b>\n` +
-            (hasReferrer ? '🎁 Il tuo referrer riceverà 1 punto\n' : '') +
-            `📊 Potrai accedere alle statistiche complete\n\n` +
-            `💡 <b>Tip:</b> L'iscrizione può essere verificata automaticamente!`;
-
+        const message = `⚽ <b>Partecipa al contest per il Napoli!</b>\n\n` +
+            `1️⃣ Unisciti al canale: ${channelLink}\n` +
+            `2️⃣ Usa /verify per confermare\n\n` +
+            `🎟️ <b>Premio:</b> 2 biglietti per Napoli-Inter, 24/05/2025!\n` +
+            (hasReferrer ? `🎁 Condividi il tuo link e scala la classfica\n` : '') +
+            `🔥 Invita più amici e scala la classifica!`;
         await this.bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
     }
 
@@ -512,7 +509,7 @@ Continua così! 🚀`;
 
     async sendReferralLink(chatId, telegramId) {
         const referralLink = `https://t.me/${this.BOT_USERNAME}?start=${telegramId}`;
-        const message = `🔗 <b>Il tuo link referral:</b>\n<code>${referralLink}</code>\n\n` +
+        const message = `🔗 <b>Il tuo link:</b>\n<code>${referralLink}</code>\n\n` +
             `💡 Condividilo con i tuoi amici per guadagnare punti!`;
 
         await this.bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
@@ -525,19 +522,16 @@ Continua così! 🚀`;
 
     // Message formatting
     formatWelcomeMessage(displayName, referrerCode, isSelfReferral = false) {
-        const baseMessage = `🎉 <b>Benvenuto ${displayName}!</b>`;
-
+        const baseMessage = `🎉 <b>Ciao ${displayName}!</b> Benvenuto nel nostro contest!`;
         if (isSelfReferral) {
-            return `${baseMessage}\n\n⚠️ Hai provato ad usare il tuo stesso link referral.\n\n` +
-                `Benvenuto comunque nella nostra community! 🚀`;
+            return `${baseMessage}\n\n⚠️ Ops! Non puoi usare il tuo stesso link referral.\n` +
+                `💥 Inizia ora: invita amici e vinci 2 biglietti per la partita del Napoli del 24/05/2025! ⚽`;
         }
-
         if (referrerCode) {
-            return `${baseMessage}\n✅ <b>Sei stato invitato da un amico!</b>\n\n` +
-                `Grazie per esserti unito alla nostra community! 🚀`;
+            return `${baseMessage}\n✅ Un amico ti ha invitato al contest!\n` +
+                `💥 Invita altri amici e vinci 2 biglietti per la partita del Napoli del 24/05/2025! ⚽`;
         }
-
-        return `${baseMessage}\n\nBenvenuto nella nostra community! 🚀`;
+        return `${baseMessage}\n💥 Invita amici e vinci 2 biglietti per la partita del Napoli del 24/05/2025! ⚽`;
     }
 
     formatStatsMessage(user) {
