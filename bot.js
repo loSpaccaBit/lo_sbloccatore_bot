@@ -612,16 +612,3 @@ process.once('SIGTERM', () => {
     process.exit(0);
 });
 
-
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Serve solo per far contento Render
-app.get('/', (req, res) => {
-    res.send('Bot attivo!');
-});
-
-app.listen(PORT, () => {
-    console.log(`🌐 Server HTTP in ascolto sulla porta ${PORT}`);
-});
