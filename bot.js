@@ -1,32 +1,36 @@
 const TelegramBot = require('node-telegram-bot-api');
 const supabase = require('./supabaseClient');
+const config = require('./config/botConfig');
 
 class ReferralBot {
     constructor() {
         this.bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
         this.BOT_USERNAME = process.env.BOT_USERNAME || 'loSbloccatore_bot';
         this.CHANNEL_ID = process.env.CHANNEL_ID;
-        this.CHANNEL_USERNAME = process.env.CHANNEL_USERNAME; // Aggiungi questo nel .env come @channelname
+        this.CHANNEL_USERNAME = process.env.CHANNEL_USERNAME;
         this.CHANNEL_NAME = process.env.CHANNEL_NAME;
+
+        // Configurazioni da botConfig.js
+        this.AUTO_CHECK_INTERVAL = config.SETTINGS.AUTO_CHECK_INTERVAL;
+        this.verificationQueue = new Set();
+
         this.initializeHandlers();
         this.setupErrorHandling();
+        this.startAutoVerification();
     }
 
     initializeHandlers() {
         // Handler per il comando /start
-        this.bot.onText(/\/start(?: (.+))?/, this.handleStart.bind(this));
+        this.bot.onText(config.PATTERNS.START_COMMAND, this.handleStart.bind(this));
 
         // Handler per il comando /stats
-        this.bot.onText(/\/stats/, this.handleStats.bind(this));
+        this.bot.onText(config.PATTERNS.STATS_COMMAND, this.handleStats.bind(this));
 
         // Handler per il comando /help
-        this.bot.onText(/\/help/, this.handleHelp.bind(this));
+        this.bot.onText(config.PATTERNS.HELP_COMMAND, this.handleHelp.bind(this));
 
         // Handler per il comando /leaderboard
-        this.bot.onText(/\/leaderboard/, this.handleLeaderboard.bind(this));
-
-        // Handler per il comando /verify (per verificare l'iscrizione al canale)
-        this.bot.onText(/\/verify/, this.handleVerifyChannel.bind(this));
+        this.bot.onText(config.PATTERNS.LEADERBOARD_COMMAND, this.handleLeaderboard.bind(this));
 
         // Handler per nuovi membri del canale
         this.bot.on('new_chat_members', this.handleNewChannelMember.bind(this));
@@ -44,10 +48,100 @@ class ReferralBot {
             console.error('Polling error:', error);
         });
 
-        // Gestione errori non catturati
         process.on('unhandledRejection', (reason, promise) => {
             console.error('Unhandled Rejection at:', promise, 'reason:', reason);
         });
+    }
+
+    // Sistema di verifica automatica
+    startAutoVerification() {
+        console.log('🔄 Sistema di verifica automatica avviato');
+
+        this.performAutoVerification();
+
+        setInterval(() => {
+            this.performAutoVerification();
+        }, this.AUTO_CHECK_INTERVAL);
+    }
+
+    async performAutoVerification() {
+        try {
+            const unverifiedUsers = await this.getUnverifiedUsers();
+
+            if (unverifiedUsers.length === 0) {
+                return;
+            }
+
+            if (config.SETTINGS.DEBUG_MODE) {
+                console.log(`🔍 Verificando ${unverifiedUsers.length} utenti non verificati...`);
+            }
+
+            for (const user of unverifiedUsers) {
+                if (this.verificationQueue.has(user.telegram_id)) {
+                    continue;
+                }
+
+                this.verificationQueue.add(user.telegram_id);
+
+                try {
+                    const isSubscribed = await this.checkChannelMembership(user.telegram_id);
+
+                    if (isSubscribed) {
+                        console.log(`✅ Utente ${user.telegram_id} trovato nel canale - verificando...`);
+
+                        await this.verifyChannelMembership(user.telegram_id);
+
+                        // Assegna il punto al referrer se presente
+                        if (user.referrer_code && user.referrer_code !== user.telegram_id) {
+                            try {
+                                const referrer = await this.incrementReferralCount(user.referrer_code);
+                                if (referrer) {
+                                    await this.notifyReferrer(referrer, user.username);
+                                }
+                            } catch (error) {
+                                console.error('Errore nel processo referral:', error);
+                            }
+                        }
+
+                        await this.notifyAutoVerification(user);
+                    }
+                } catch (error) {
+                    console.error(`Errore nella verifica automatica per ${user.telegram_id}:`, error);
+                } finally {
+                    this.verificationQueue.delete(user.telegram_id);
+                }
+
+                await this.sleep(config.SETTINGS.VERIFICATION_DELAY);
+            }
+        } catch (error) {
+            console.error('Errore nella verifica automatica:', error);
+        }
+    }
+
+    async getUnverifiedUsers() {
+        const { data, error } = await supabase
+            .from('referrals')
+            .select('telegram_id, username, referrer_code, created_at')
+            .eq('channel_verified', false)
+            .gte('created_at', new Date(Date.now() - config.SETTINGS.MAX_VERIFICATION_AGE).toISOString());
+
+        if (error) {
+            throw new Error(`Errore nel recupero utenti non verificati: ${error.message}`);
+        }
+
+        return data || [];
+    }
+
+    async notifyAutoVerification(user) {
+        try {
+            const hasReferrer = user.referrer_code && user.referrer_code !== user.telegram_id;
+            const message = config.MESSAGES.AUTO_VERIFICATION_SUCCESS(hasReferrer);
+
+            await this.bot.sendMessage(user.telegram_id, message, { parse_mode: 'HTML' });
+            console.log(`✅ Notifica verifica automatica inviata a ${user.telegram_id}`);
+        } catch (error) {
+            console.log(`Non è stato possibile notificare l'utente ${user.telegram_id}:`, error.message);
+        }
     }
 
     async handleStart(msg, match) {
@@ -70,7 +164,7 @@ class ReferralBot {
 
         } catch (error) {
             console.error('Errore in handleStart:', error);
-            await this.sendErrorMessage(chatId, 'Si è verificato un errore durante la registrazione.');
+            await this.sendMessage(chatId, config.MESSAGES.ERROR_GENERIC);
         }
     }
 
@@ -82,136 +176,42 @@ class ReferralBot {
             const user = await this.findUserByTelegramId(telegramId);
 
             if (!user) {
-                return this.bot.sendMessage(chatId,
-                    '❌ Utente non trovato. Usa /start per registrarti prima.'
-                );
+                return this.sendMessage(chatId, config.MESSAGES.USER_NOT_FOUND);
             }
 
-            const statsMessage = this.formatStatsMessage(user);
-            await this.bot.sendMessage(chatId, statsMessage, { parse_mode: 'HTML' });
+            const statsMessage = config.FORMATTERS.STATS_MESSAGE(user, this.BOT_USERNAME);
+            await this.sendMessage(chatId, statsMessage);
 
         } catch (error) {
             console.error('Errore in handleStats:', error);
-            await this.sendErrorMessage(chatId, 'Errore nel recupero delle statistiche.');
+            await this.sendMessage(chatId, config.MESSAGES.ERROR_STATS);
         }
     }
 
     async handleHelp(msg) {
         const chatId = msg.chat.id;
-        ///leaderboard - Classifica dei top referrer
-        const helpMessage = `
-🤖 <b>Comandi disponibili:</b>
-
-/start - Avvia il bot e ottieni il tuo link referral
-/stats - Visualizza le tue statistiche
-/verify - Verifica la tua iscrizione al canale
-/help - Mostra questo messaggio
-
-🔗 <b>Come funziona:</b>
-1. Condividi il tuo link referral con gli amici
-2. Quando si iscrivono al bot E al canale, guadagni punti
-3. Usa /verify per controllare l'iscrizione al canale
-4. Controlla le tue statistiche con /stats
-
-📱 <b>Importante:</b> I punti vengono assegnati solo dopo l'iscrizione al canale!
-
-💡 <b>Suggerimento:</b> Più amici inviti, più sali in classifica!
-        `.trim();
-
-        await this.bot.sendMessage(chatId, helpMessage, { parse_mode: 'HTML' });
+        await this.sendMessage(chatId, config.MESSAGES.HELP_MESSAGE);
     }
 
     async handleLeaderboard(msg) {
         const chatId = msg.chat.id;
 
         try {
-            const topUsers = await this.getTopReferrers(10);
-
-            if (topUsers.length === 0) {
-                return this.bot.sendMessage(chatId,
-                    '📊 La classifica è ancora vuota. Sii il primo a invitare qualcuno!'
-                );
-            }
-
-            const leaderboardMessage = this.formatLeaderboardMessage(topUsers);
-            await this.bot.sendMessage(chatId, leaderboardMessage, { parse_mode: 'HTML' });
+            const topUsers = await this.getTopReferrers(config.SETTINGS.LEADERBOARD_LIMIT);
+            const leaderboardMessage = config.FORMATTERS.LEADERBOARD_MESSAGE(topUsers);
+            await this.sendMessage(chatId, leaderboardMessage);
 
         } catch (error) {
             console.error('Errore in handleLeaderboard:', error);
-            await this.sendErrorMessage(chatId, 'Errore nel recupero della classifica.');
-        }
-    }
-
-    async handleVerifyChannel(msg) {
-        const chatId = msg.chat.id;
-        const telegramId = msg.from.id.toString();
-
-        try {
-            const user = await this.findUserByTelegramId(telegramId);
-
-            if (!user) {
-                return this.bot.sendMessage(chatId,
-                    '❌ Utente non trovato. Usa /start per registrarti prima.'
-                );
-            }
-
-            if (user.channel_verified) {
-                return this.bot.sendMessage(chatId,
-                    '✅ Hai già verificato la tua iscrizione al canale!'
-                );
-            }
-
-            const isSubscribed = await this.checkChannelMembership(telegramId);
-
-            if (isSubscribed) {
-                await this.verifyChannelMembership(telegramId);
-
-                // Assegna il punto al referrer se presente
-                if (user.referrer_code && user.referrer_code !== telegramId) {
-                    try {
-                        const referrer = await this.incrementReferralCount(user.referrer_code);
-                        if (referrer) {
-                            await this.notifyReferrer(referrer, user.username);
-                        }
-                    } catch (error) {
-                        console.error('Errore nel processo referral:', error);
-                    }
-                }
-
-                await this.bot.sendMessage(chatId,
-                    '🎉 <b>Perfetto!</b>\n\n✅ Iscrizione al canale verificata!\n' +
-                    (user.referrer_code && user.referrer_code !== telegramId ?
-                        '🎁 Il tuo referrer ha ricevuto 1 punto!' : ''),
-                    { parse_mode: 'HTML' }
-                );
-            } else {
-                await this.bot.sendMessage(chatId,
-                    `❌ <b>Non risulti iscritto al canale!</b>\n\n` +
-                    `📱 <b>Per completare la registrazione:</b>\n` +
-                    `1. Iscriviti al canale: ${this.CHANNEL_USERNAME || this.CHANNEL_NAME}\n` +
-                    `2. Torna qui e usa il comando /verify\n\n` +
-                    `💡 Solo dopo l'iscrizione al canale i punti verranno assegnati!`,
-                    { parse_mode: 'HTML' }
-                );
-            }
-
-        } catch (error) {
-            console.error('Errore in handleVerifyChannel:', error);
-            await this.sendErrorMessage(chatId, 'Errore nella verifica del canale.');
+            await this.sendMessage(chatId, config.MESSAGES.ERROR_LEADERBOARD);
         }
     }
 
     async handleNewChannelMember(msg) {
-        // Questo handler viene chiamato quando qualcuno si unisce al canale
-        // Verifica automaticamente se l'utente è nel sistema referral
         console.log('Nuovo membro nel canale, chat ID:', msg.chat.id);
 
-        // Controlla se il messaggio proviene dal canale corretto
         const chatId = msg.chat.id.toString();
         const targetChannelId = this.CHANNEL_ID.toString();
-
-        console.log('Chat ID messaggio:', chatId);
-        console.log('Channel ID configurato:', targetChannelId);
 
         if (chatId === targetChannelId || chatId === targetChannelId.replace('-100', '')) {
             const newMembers = msg.new_chat_members;
@@ -236,17 +236,7 @@ class ReferralBot {
                         }
 
                         // Notifica l'utente
-                        try {
-                            await this.bot.sendMessage(telegramId,
-                                '🎉 <b>Benvenuto nel canale!</b>\n\n' +
-                                '✅ La tua iscrizione è stata verificata automaticamente!\n' +
-                                (user.referrer_code && user.referrer_code !== telegramId ?
-                                    '🎁 Il tuo amico ha ricevuto 1 punto!\n\nProvaci anche TU!' : ''),
-                                { parse_mode: 'HTML' }
-                            );
-                        } catch (notifyError) {
-                            console.log('Non è stato possibile notificare l\'utente direttamente:', notifyError.message);
-                        }
+                        await this.notifyAutoVerification(user);
                     }
                 } catch (error) {
                     console.error('Errore nel processare nuovo membro:', error);
@@ -256,17 +246,16 @@ class ReferralBot {
     }
 
     async handleUnknownMessage(msg) {
-        // Ignora i comandi già gestiti e i messaggi del canale
         if (msg.chat.type === 'channel') {
-            return; // Ignora i messaggi del canale
+            return;
         }
 
         if (msg.text && msg.text.startsWith('/')) {
             const command = msg.text.split(' ')[0];
-            if (!['/start', '/stats', '/help', '/leaderboard', '/verify'].includes(command)) {
-                await this.bot.sendMessage(msg.chat.id,
-                    '❓ Comando non riconosciuto. Usa /help per vedere i comandi disponibili.'
-                );
+            const knownCommands = ['/start', '/stats', '/help', '/leaderboard'];
+
+            if (!knownCommands.includes(command)) {
+                await this.sendMessage(msg.chat.id, config.MESSAGES.UNKNOWN_COMMAND);
             }
         }
     }
@@ -285,7 +274,7 @@ class ReferralBot {
     }
 
     logDebugInfo(msg, user, referrerCode) {
-        if (process.env.NODE_ENV === 'development') {
+        if (config.SETTINGS.DEBUG_MODE) {
             console.log('=== DEBUG INFO ===');
             console.log('Messaggio:', msg.text);
             console.log('User Info:', user);
@@ -298,20 +287,19 @@ class ReferralBot {
         try {
             let chatId = this.CHANNEL_ID;
 
-            console.log('Verificando iscrizione per utente:', telegramId);
-            console.log('Channel ID configurato:', chatId);
+            if (config.SETTINGS.DEBUG_MODE) {
+                console.log('Verificando iscrizione per utente:', telegramId);
+                console.log('Channel ID configurato:', chatId);
+            }
 
-            // Verifica che CHANNEL_ID sia configurato
             if (!chatId) {
                 console.error('CHANNEL_ID non configurato nel file .env');
                 return false;
             }
 
-            // Se CHANNEL_ID inizia con @, prova a ottenere le info del canale
             if (chatId.startsWith('@')) {
                 try {
                     const chat = await this.bot.getChat(chatId);
-                    console.log('Info canale ottenute:', chat.id);
                     chatId = chat.id.toString();
                 } catch (error) {
                     console.error('Impossibile ottenere info del canale con username:', error.message);
@@ -320,22 +308,18 @@ class ReferralBot {
             }
 
             const member = await this.bot.getChatMember(chatId, telegramId);
-            console.log('Status membro:', member.status);
-
             const validStatuses = ['member', 'administrator', 'creator'];
             const isValid = validStatuses.includes(member.status);
 
-            console.log('Iscrizione valida:', isValid);
+            if (config.SETTINGS.DEBUG_MODE) {
+                console.log('Status membro:', member.status);
+                console.log('Iscrizione valida:', isValid);
+            }
+
             return isValid;
 
         } catch (error) {
             console.error(`Errore durante la verifica dell'iscrizione al canale:`, error.message);
-
-            // Log più dettagliato per debug
-            if (error.response && error.response.body) {
-                console.error('Dettagli errore API:', error.response.body);
-            }
-
             return false;
         }
     }
@@ -360,7 +344,7 @@ class ReferralBot {
     async findUserByTelegramId(telegramId) {
         const { data, error } = await supabase
             .from('referrals')
-            .select('*')
+            .select(config.QUERIES.FIND_USER)
             .eq('telegram_id', telegramId)
             .maybeSingle();
 
@@ -432,7 +416,7 @@ class ReferralBot {
     async getTopReferrers(limit = 10) {
         const { data, error } = await supabase
             .from('referrals')
-            .select('telegram_id, username, referral_count, created_at')
+            .select(config.QUERIES.TOP_REFERRERS)
             .gt('referral_count', 0)
             .order('referral_count', { ascending: false })
             .order('created_at', { ascending: true })
@@ -461,46 +445,34 @@ class ReferralBot {
 
         if (referrerCode === user.telegramId) {
             console.log(`⚠️ Tentativo di auto-referral bloccato per utente ${user.telegramId}`);
-            await this.bot.sendMessage(chatId,
-                '⚠️ <b>Attenzione:</b> Non puoi usare il tuo stesso link referral!',
-                { parse_mode: 'HTML' }
-            );
+            await this.sendMessage(chatId, config.MESSAGES.SELF_REFERRAL_WARNING);
         }
 
-        const welcomeMessage = this.formatWelcomeMessage(user.displayName, referrerCode, referrerCode === user.telegramId);
-        await this.bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML' });
+        const welcomeMessage = config.MESSAGES.WELCOME_NEW_USER(
+            user.displayName,
+            referrerCode,
+            referrerCode === user.telegramId
+        );
 
+        await this.sendMessage(chatId, welcomeMessage);
         await this.sendChannelInstructions(chatId, !!referrerCode && referrerCode !== user.telegramId);
     }
 
     async sendChannelInstructions(chatId, hasReferrer) {
         const channelLink = this.CHANNEL_USERNAME || this.CHANNEL_NAME || 'il nostro canale';
-        const message = `⚽ <b>Partecipa al contest per il Napoli!</b>\n\n` +
-            `1️⃣ Unisciti al canale: ${channelLink}\n` +
-            `2️⃣ Usa /verify per confermare\n\n` +
-            `🎟️ <b>Premio:</b> 2 biglietti per Napoli-Inter, 24/05/2025!\n` +
-            (hasReferrer ? `🎁 Condividi il tuo link e scala la classfica\n` : '') +
-            `🔥 Invita più amici e scala la classifica!`;
-        await this.bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
+        const message = config.MESSAGES.CHANNEL_INSTRUCTIONS(channelLink, hasReferrer);
+        await this.sendMessage(chatId, message);
     }
 
     async handleReturningUser(user, chatId) {
-        const message = `👋 <b>Bentornato ${user.displayName}!</b>\n\n` +
-            `Usa /stats per vedere le tue statistiche attuali.`;
-
-        await this.bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
+        const message = config.MESSAGES.WELCOME_RETURNING_USER(user.displayName);
+        await this.sendMessage(chatId, message);
     }
 
     async notifyReferrer(referrer, newUserName) {
         try {
-            const message = `🎉 <b>Congratulazioni!</b>
-
-👤 <b>${newUserName}</b> si è iscritto usando il tuo link referral!
-📊 <b>Totale tuoi referral:</b> ${referrer.referral_count + 1}
-
-Continua così! 🚀`;
-
-            await this.bot.sendMessage(referrer.telegram_id, message, { parse_mode: 'HTML' });
+            const message = config.MESSAGES.REFERRAL_NOTIFICATION(newUserName, referrer.referral_count + 1);
+            await this.sendMessage(referrer.telegram_id, message);
             console.log(`✅ Notifica inviata a ${referrer.telegram_id}`);
         } catch (error) {
             console.error('Errore nell\'invio notifica al referrer:', error);
@@ -509,68 +481,19 @@ Continua così! 🚀`;
 
     async sendReferralLink(chatId, telegramId) {
         const referralLink = `https://t.me/${this.BOT_USERNAME}?start=${telegramId}`;
-        const message = `🔗 <b>Il tuo link:</b>\n${referralLink}\n\n` +
-            `💡 Condividilo con i tuoi amici per guadagnare punti!`;
-
-        await this.bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
+        const message = config.MESSAGES.REFERRAL_LINK(referralLink);
+        await this.sendMessage(chatId, message);
     }
 
-    async sendErrorMessage(chatId, message) {
-        const errorMessage = `❌ ${message}\n\nSe il problema persiste, contatta il supporto.`;
-        await this.bot.sendMessage(chatId, errorMessage);
+    // Wrapper per l'invio messaggi con parse_mode automatico
+    async sendMessage(chatId, message, options = {}) {
+        const defaultOptions = { parse_mode: 'HTML', ...options };
+        return this.bot.sendMessage(chatId, message, defaultOptions);
     }
 
-    // Message formatting
-    formatWelcomeMessage(displayName, referrerCode, isSelfReferral = false) {
-        const baseMessage = `🎉 <b>Ciao ${displayName}!</b> Benvenuto nel nostro contest!`;
-        if (isSelfReferral) {
-            return `${baseMessage}\n\n⚠️ Ops! Non puoi usare il tuo stesso link referral.\n` +
-                `💥 Inizia ora: invita amici e vinci 2 biglietti per la partita del Napoli del 24/05/2025! ⚽`;
-        }
-        if (referrerCode) {
-            return `${baseMessage}\n✅ Un amico ti ha invitato al contest!\n` +
-                `💥 Invita altri amici e vinci 2 biglietti per la partita del Napoli del 24/05/2025! ⚽`;
-        }
-        return `${baseMessage}\n💥 Invita amici e vinci 2 biglietti per la partita del Napoli del 24/05/2025! ⚽`;
-    }
-
-    formatStatsMessage(user) {
-        const registrationDate = new Date(user.created_at).toLocaleDateString('it-IT');
-        const lastReferralDate = user.last_referral_date
-            ? new Date(user.last_referral_date).toLocaleDateString('it-IT')
-            : 'Mai';
-        const channelStatus = user.channel_verified ? '✅ Verificato' : '❌ Non verificato';
-
-        return `📊 <b>Le tue statistiche:</b>
-
-👤 <b>Username:</b> ${user.username}
-👥 <b>Referral invitati:</b> ${user.referral_count || 0}
-📅 <b>Registrato il:</b> ${registrationDate}
-🕐 <b>Ultimo referral:</b> ${lastReferralDate}
-📱 <b>Canale:</b> ${channelStatus}
-
-🔗 <b>Il tuo link:</b>
-<code>https://t.me/${this.BOT_USERNAME}?start=${user.telegram_id}</code>
-
-${!user.channel_verified ? '\n⚠️ <b>Iscriviti al canale e usa /verify per completare la registrazione!</b>' : ''}`;
-    }
-
-    formatLeaderboardMessage(topUsers) {
-        const medals = ['🥇', '🥈', '🥉'];
-        let message = '🏆 <b>Classifica Top Referrer:</b>\n\n';
-
-        topUsers.forEach((user, index) => {
-            const medal = medals[index] || `${index + 1}.`;
-            const username = user.username.startsWith('user_')
-                ? `Utente ${user.username.slice(-4)}`
-                : user.username;
-
-            message += `${medal} <b>${username}</b> - ${user.referral_count} referral\n`;
-        });
-
-        message += '\n🚀 Continua a invitare amici per scalare la classifica!';
-
-        return message;
+    // Utility per sleep
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     start() {
@@ -578,10 +501,11 @@ ${!user.channel_verified ? '\n⚠️ <b>Iscriviti al canale e usa /verify per co
         console.log(`📝 Modalità: ${process.env.NODE_ENV || 'production'}`);
         console.log(`📱 Channel ID: ${this.CHANNEL_ID}`);
         console.log(`📱 Channel Username: ${this.CHANNEL_USERNAME}`);
+        console.log(`🔄 Verifica automatica ogni ${this.AUTO_CHECK_INTERVAL / 1000} secondi`);
 
         // Log per debug degli ID canale
         this.bot.on('message', (msg) => {
-            if (msg.chat && msg.chat.type === 'channel') {
+            if (msg.chat && msg.chat.type === 'channel' && config.SETTINGS.DEBUG_MODE) {
                 console.log('ID del canale rilevato:', msg.chat.id);
                 console.log('Username del canale:', msg.chat.username);
             }
@@ -605,4 +529,3 @@ process.once('SIGTERM', () => {
     referralBot.bot.stopPolling();
     process.exit(0);
 });
-
